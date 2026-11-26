@@ -1,0 +1,28 @@
+services:
+  thumbnails:
+    build: .
+    image: aerial-thumbnails:latest
+    ports:
+      - "${THUMBNAIL_PORT:-8000}:8000"
+    environment:
+      # Number of attempts that may execute at the same time (global).
+      THUMBNAIL_SLOTS: "${THUMBNAIL_SLOTS:-4}"
+      # Seconds a first attempt may run before one make-up attempt is allowed.
+      THUMBNAIL_RETRY_AFTER_SECONDS: "${THUMBNAIL_RETRY_AFTER_SECONDS:-30}"
+      # Longest edge of the delivered thumbnail.
+      THUMBNAIL_MAX_EDGE: "${THUMBNAIL_MAX_EDGE:-256}"
+      # Per-file upload cap in bytes; 0 disables it.
+      THUMBNAIL_MAX_UPLOAD_BYTES: "${THUMBNAIL_MAX_UPLOAD_BYTES:-0}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    # One container, one process: in-memory scheduler state is not shared.
+    deploy:
+      replicas: 1
