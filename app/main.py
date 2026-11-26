@@ -29,15 +29,40 @@ Delivery rules:
   failed; a job that was retried therefore needs *both* attempts to fail.
 * Retried jobs never get a third attempt.
 
+Disk staging model
+------------------
+Uploaded originals are never accumulated in memory.  The upload handler reads
+each multipart file in fixed-size chunks (``STAGING_CHUNK_BYTES``) and streams
+them into a private staging directory on local disk:
+
+    <staging_dir>/.incoming/<session>/<index>.part   # during upload
+    <staging_dir>/<batch_id>/<job_id>.png            # once the batch commits
+
+A file is validated (non-empty, size limit, PNG) straight from its staged
+path, one file at a time.  The whole batch is registered and dispatched only
+after *every* file has been written and validated; any bad image, oversized
+file or disk-write failure rejects the entire batch and removes the session
+directory.  Waiting jobs keep only a reference (the staged file path), never
+the original bytes, so both the first attempt and a later retry open the same
+on-disk original long after the upload request has ended.
+
+The staged original is deleted when the job's last execution copy finishes
+(success or failure); an empty batch directory is pruned at the same time.
+The first successful thumbnail stays downloadable regardless of when the
+original is cleaned up.
+
 State is in-memory and process-local: run exactly one instance (the shipped
-docker compose file does).
+docker compose file does).  Staging leftovers from a crashed process are
+swept at startup because the in-memory state that referenced them is gone.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -45,16 +70,26 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 
 
+# Indirection over the builtin open: tests swap it to simulate disk failures
+# while everything else keeps using the real builtin (PIL, stdlib, ...).
+_open = open
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+# Uploaded multipart files are drained in chunks of this many bytes so that a
+# whole batch of large originals is never held in memory at once.
+STAGING_CHUNK_BYTES = 1024 * 1024
+
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     raw = os.environ.get(name)
@@ -95,6 +130,11 @@ class Settings:
     max_edge: int = field(default_factory=lambda: max(1, _env_int("THUMBNAIL_MAX_EDGE", 256)))
     # Max bytes per uploaded file; 0 disables the check.
     max_upload_bytes: int = field(default_factory=lambda: _env_int("THUMBNAIL_MAX_UPLOAD_BYTES", 0))
+    # Local-disk directory where uploaded originals are staged until the last
+    # execution copy of a job finishes.
+    staging_dir: str = field(
+        default_factory=lambda: os.environ.get("THUMBNAIL_STAGING_DIR", ".staging")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +182,9 @@ class Attempt:
 class Job:
     job_id: str
     filename: str
-    data: Optional[bytes]
+    # Reference to the staged original on local disk.  Cleared (and the file
+    # removed) when the job's last execution copy finishes.
+    source_path: Optional[str]
     state: JobState = JobState.PENDING
     attempts: List[Attempt] = field(default_factory=list)
     result: Optional[bytes] = None
@@ -166,8 +208,17 @@ class Batch:
     job_ids: List[str] = field(default_factory=list)
 
 
+@dataclass
+class _StagedFile:
+    filename: str
+    partial_path: str
+    handle: Optional[BinaryIO]
+    size: int
+    finalized: bool = False
+
+
 class JobRejected(Exception):
-    """Upload rejected before a batch was created (bad or oversized file)."""
+    """Upload rejected before a batch was created (bad/oversized file or disk failure)."""
 
 
 def _iso(ts: float) -> str:
@@ -176,15 +227,101 @@ def _iso(ts: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Staging area
+# ---------------------------------------------------------------------------
+
+class StagingStore:
+    """On-disk staging area for uploaded originals.
+
+    Layout::
+
+        <root>/.incoming/<session>/<index>.part   # being uploaded / validated
+        <root>/<batch_id>/<job_id>.png            # committed originals
+
+    Everything lives on one filesystem so publishing a batch is a pair of
+    atomic directory renames.
+    """
+
+    INCOMING_DIRNAME = ".incoming"
+
+    def __init__(self, root: str):
+        self.root = os.path.abspath(root)
+        self.incoming_root = os.path.join(self.root, self.INCOMING_DIRNAME)
+        os.makedirs(self.incoming_root, exist_ok=True)
+        # Scheduler state is process-local and does not survive a restart, so
+        # anything left on disk by a previous process is orphaned garbage.
+        self.sweep()
+
+    def sweep(self) -> None:
+        """Remove stale staging data (crashed uploads and orphaned batches)."""
+        for base in (self.incoming_root, self.root):
+            try:
+                names = os.listdir(base)
+            except FileNotFoundError:
+                continue
+            for name in names:
+                if base is self.root and name == self.INCOMING_DIRNAME:
+                    continue
+                shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+
+    def new_session(self) -> Tuple[str, str]:
+        session_id = secrets.token_hex(8)
+        directory = os.path.join(self.incoming_root, session_id)
+        os.makedirs(directory, exist_ok=False)
+        return session_id, directory
+
+    def partial_path(self, session_dir: str, index: int) -> str:
+        return os.path.join(session_dir, f"{index}.part")
+
+    def commit(self, session_dir: str, batch_id: str, job_ids: List[str]) -> Dict[str, str]:
+        """Publish a fully validated session as a batch directory.
+
+        Partials are renamed to ``<job_id>.png`` and the session directory is
+        atomically moved to ``<root>/<batch_id>``.  Returns the final staged
+        path keyed by job id.
+        """
+        for index, job_id in enumerate(job_ids):
+            os.rename(
+                self.partial_path(session_dir, index),
+                os.path.join(session_dir, f"{job_id}.png"),
+            )
+        batch_dir = os.path.join(self.root, batch_id)
+        os.rename(session_dir, batch_dir)
+        return {job_id: os.path.join(batch_dir, f"{job_id}.png") for job_id in job_ids}
+
+    def discard_session(self, session_dir: str) -> None:
+        """Delete every partial file produced by a rejected upload."""
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    def release(self, path: str) -> None:
+        """Remove one staged original; prune the batch directory once empty."""
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return
+        batch_dir = os.path.dirname(path)
+        try:
+            # Only succeeds once every original of the batch is gone.
+            os.rmdir(batch_dir)
+        except OSError:
+            pass
+
+    def discard_all(self) -> None:
+        self.sweep()
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
-def render_thumbnail(data: bytes, max_edge: int) -> Tuple[bytes, Tuple[int, int]]:
-    """Downscale PNG bytes to fit ``max_edge``; return (png_bytes, (w, h)).
+def render_thumbnail(source_path: str, max_edge: int) -> Tuple[bytes, Tuple[int, int]]:
+    """Downscale the PNG at ``source_path`` to fit ``max_edge``.
 
-    Aspect ratio is preserved.  Smaller images are not upscaled.
+    Returns ``(png_bytes, (w, h))``.  Aspect ratio is preserved; smaller
+    images are not upscaled.  The original is read straight from disk, so the
+    worker never needs the full payload handed to it in memory.
     """
-    with Image.open(io.BytesIO(data)) as img:
+    with Image.open(source_path) as img:
         img.load()
         if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
             img = img.convert("RGBA")
@@ -208,13 +345,17 @@ class ThumbnailService:
     def __init__(
         self,
         settings: Settings,
-        renderer: Optional[Callable[[bytes, int], Tuple[bytes, Tuple[int, int]]]] = None,
+        renderer: Optional[Callable[[str, int], Tuple[bytes, Tuple[int, int]]]] = None,
+        staging: Optional[StagingStore] = None,
     ):
         self.settings = settings
         self._render = renderer or render_thumbnail
+        self.staging = staging or StagingStore(settings.staging_dir)
         self._lock = threading.RLock()
         self._batches: Dict[str, Batch] = {}
         self._jobs: Dict[str, Job] = {}
+        # Upload session id -> {"dir": str, "files": {index: _StagedFile}}
+        self._uploads: Dict[str, dict] = {}
         self._in_flight = 0
         self._executor = ThreadPoolExecutor(
             max_workers=settings.slot_count, thread_name_prefix="thumb"
@@ -230,37 +371,162 @@ class ThumbnailService:
     def shutdown(self) -> None:
         self._stop.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        # Best effort: worker threads are daemons; remove what is still here.
+        self.staging.discard_all()
 
     def _ticker_loop(self) -> None:
         while not self._stop.wait(self.TICK_SECONDS):
             with self._lock:
                 self._dispatch_locked()
 
-    # -- ingestion ---------------------------------------------------------
+    # -- ingestion: chunked staging ---------------------------------------
 
-    def create_batch(self, uploads: List[Tuple[str, bytes]]) -> Batch:
-        """Validate every file, then register the batch atomically."""
-        validated = [(name, data) for name, data in (self._validate(*u) for u in uploads)]
-        batch = Batch(batch_id=uuid.uuid4().hex, created_at=time.time())
+    def begin_upload(self) -> str:
+        """Open a private staging session for one multipart upload request."""
         with self._lock:
+            session_id, directory = self.staging.new_session()
+            self._uploads[session_id] = {"dir": directory, "files": {}}
+            return session_id
+
+    def stage_chunk(self, session_id: str, index: int, filename: str, chunk: bytes) -> None:
+        """Append one chunk of file ``index`` to its staged partial.
+
+        The size limit is enforced while streaming, before the chunk is
+        written, so an oversized file cannot fill the disk first.
+        """
+        with self._lock:
+            upload = self._uploads.get(session_id)
+            if upload is None:
+                raise JobRejected("upload session is not open")
+            staged = upload["files"].get(index)
+            if staged is None:
+                partial = self.staging.partial_path(upload["dir"], index)
+                try:
+                    # Module-level seam so tests can simulate write failures.
+                    handle = _open(partial, "wb")
+                except OSError as exc:
+                    raise JobRejected(f"{filename}: cannot stage upload ({exc})") from exc
+                staged = _StagedFile(
+                    filename=filename, partial_path=partial, handle=handle, size=0
+                )
+                upload["files"][index] = staged
+
+        limit = self.settings.max_upload_bytes
+        if limit and staged.size + len(chunk) > limit:
+            raise JobRejected(
+                f"{filename}: upload would exceed limit of {limit} bytes"
+            )
+        try:
+            staged.handle.write(chunk)
+        except OSError as exc:
+            raise JobRejected(f"{filename}: failed to write staged file ({exc})") from exc
+        staged.size += len(chunk)
+
+    def finish_file(self, session_id: str, index: int, filename: str) -> None:
+        """Close and validate one staged file while the batch stays unregistered."""
+        with self._lock:
+            upload = self._uploads.get(session_id)
+            if upload is None:
+                raise JobRejected("upload session is not open")
+            staged = upload["files"].get(index)
+            if staged is None:
+                # No chunk ever arrived: create an empty partial so the same
+                # validation path reports the empty-file rejection.
+                partial = self.staging.partial_path(upload["dir"], index)
+                _open(partial, "wb").close()
+                staged = _StagedFile(
+                    filename=filename, partial_path=partial, handle=None, size=0
+                )
+                upload["files"][index] = staged
+
+        if staged.handle is not None and not staged.finalized:
+            try:
+                staged.handle.flush()
+                staged.handle.close()
+            except OSError as exc:
+                raise JobRejected(f"{filename}: failed to flush staged file ({exc})") from exc
+            staged.finalized = True
+        self._validate_staged(staged)
+
+    def commit_upload(self, session_id: str, filenames: List[str]) -> Batch:
+        """Register and dispatch the batch after all files passed validation."""
+        with self._lock:
+            upload = self._uploads.pop(session_id, None)
+            if upload is None:
+                raise JobRejected("upload session is not open")
+            directory = upload["dir"]
+            files = upload["files"]
+            for index, filename in enumerate(filenames):
+                staged = files.get(index)
+                if staged is None or not staged.finalized:
+                    raise JobRejected(f"{filename}: upload was not finalized")
+
+            batch = Batch(batch_id=uuid.uuid4().hex, created_at=time.time())
+            job_ids = [secrets.token_hex(8) for _ in filenames]
+            try:
+                paths = self.staging.commit(directory, batch.batch_id, job_ids)
+            except OSError as exc:
+                self.staging.discard_session(directory)
+                raise JobRejected(f"failed to publish staged upload ({exc})") from exc
+
+            for (_, filename), job_id in zip(enumerate(filenames), job_ids):
+                job = Job(
+                    job_id=job_id,
+                    filename=filename,
+                    source_path=paths[job_id],
+                )
+                batch.job_ids.append(job_id)
+                self._jobs[job_id] = job
             self._batches[batch.batch_id] = batch
-            for filename, data in validated:
-                job = Job(job_id=secrets.token_hex(8), filename=filename, data=data)
-                batch.job_ids.append(job.job_id)
-                self._jobs[job.job_id] = job
             self._dispatch_locked()
         return batch
 
-    def _validate(self, filename: str, data: bytes) -> Tuple[str, bytes]:
-        if not data:
+    def abort_upload(self, session_id: str) -> None:
+        """Reject the whole batch: close handles and delete all staged files."""
+        with self._lock:
+            upload = self._uploads.pop(session_id, None)
+        if upload is None:
+            return
+        for staged in upload["files"].values():
+            if staged.handle is not None and not staged.finalized:
+                try:
+                    staged.handle.close()
+                except OSError:
+                    pass
+        self.staging.discard_session(upload["dir"])
+
+    def create_batch(self, uploads: List[Tuple[str, bytes]]) -> Batch:
+        """In-memory convenience wrapper used by tests and local callers.
+
+        Data is still streamed through the same chunked staging pipeline (in
+        ``STAGING_CHUNK_BYTES`` pieces) instead of being registered directly.
+        """
+        session_id = self.begin_upload()
+        try:
+            filenames: List[str] = []
+            for index, (filename, data) in enumerate(uploads):
+                filenames.append(filename)
+                for start in range(0, len(data), STAGING_CHUNK_BYTES):
+                    self.stage_chunk(
+                        session_id, index, filename, data[start:start + STAGING_CHUNK_BYTES]
+                    )
+                self.finish_file(session_id, index, filename)
+            return self.commit_upload(session_id, filenames)
+        except JobRejected:
+            self.abort_upload(session_id)
+            raise
+
+    def _validate_staged(self, staged: _StagedFile) -> None:
+        filename, path, size = staged.filename, staged.partial_path, staged.size
+        if size == 0:
             raise JobRejected(f"{filename}: empty file")
         limit = self.settings.max_upload_bytes
-        if limit and len(data) > limit:
-            raise JobRejected(f"{filename}: {len(data)} bytes exceeds limit of {limit}")
+        if limit and size > limit:
+            raise JobRejected(f"{filename}: {size} bytes exceeds limit of {limit}")
         try:
-            with Image.open(io.BytesIO(data)) as probe:
+            with Image.open(path) as probe:
                 probe.verify()
-            with Image.open(io.BytesIO(data)) as probe:
+            with Image.open(path) as probe:
                 if probe.format != "PNG":
                     raise JobRejected(f"{filename}: not a PNG image")
                 probe.load()
@@ -268,7 +534,6 @@ class ThumbnailService:
             raise
         except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
             raise JobRejected(f"{filename}: invalid PNG ({exc})") from exc
-        return filename, data
 
     # -- scheduling --------------------------------------------------------
 
@@ -308,11 +573,14 @@ class ThumbnailService:
     # -- execution ---------------------------------------------------------
 
     def _run_attempt(self, job_id: str, attempt: Attempt) -> None:
-        data = self._jobs[job_id].data
+        job = self._jobs[job_id]
+        source = job.source_path
         try:
-            if data is None:  # pragma: no cover - defensive
-                raise RuntimeError("payload unavailable")
-            png, size = self._render(data, self.settings.max_edge)
+            if not source or not os.path.exists(source):
+                raise RuntimeError("staged original is unavailable")
+            # Both the first and the make-up attempt read the same staged
+            # file; nothing is passed in memory between requests and workers.
+            png, size = self._render(source, self.settings.max_edge)
         except Exception as exc:  # noqa: BLE001 - worker thread must never die
             self._finish_attempt(
                 job_id, attempt, result=None, size=None,
@@ -362,7 +630,13 @@ class ThumbnailService:
                     job.state = JobState.RUNNING
 
             if not job.has_running_attempt:
-                job.data = None  # release the original payload
+                # Last execution copy (success or failure) has returned: the
+                # staged original is no longer needed.  The delivered
+                # thumbnail bytes are kept regardless.
+                source = job.source_path
+                job.source_path = None
+                if source is not None:
+                    self.staging.release(source)
             self._in_flight -= 1
             self._dispatch_locked()
 
@@ -409,6 +683,7 @@ class ThumbnailService:
                 "free_slots": self.settings.slot_count - self._in_flight,
                 "retry_after_seconds": self.settings.retry_after_seconds,
                 "max_edge": self.settings.max_edge,
+                "staging_dir": self.staging.root,
                 "jobs": counts,
             }
 
@@ -441,10 +716,11 @@ def _summarize_failures(job: Job) -> str:
 
 def create_app(
     settings: Optional[Settings] = None,
-    renderer: Optional[Callable[[bytes, int], Tuple[bytes, Tuple[int, int]]]] = None,
+    renderer: Optional[Callable[[str, int], Tuple[bytes, Tuple[int, int]]]] = None,
+    staging: Optional[StagingStore] = None,
 ) -> FastAPI:
     settings = settings or Settings()
-    service = ThumbnailService(settings, renderer=renderer)
+    service = ThumbnailService(settings, renderer=renderer, staging=staging)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -471,17 +747,38 @@ def create_app(
     ) -> JSONResponse:
         if not files:
             raise HTTPException(status_code=400, detail="no files uploaded")
-        payloads: List[Tuple[str, bytes]] = []
-        for upload in files:
-            try:
-                data = await upload.read()
-            finally:
-                await upload.close()
-            payloads.append((upload.filename or "unnamed.png", data))
+
+        session_id = service.begin_upload()
+        filenames: List[str] = []
         try:
-            batch = service.create_batch(payloads)
+            for index, upload in enumerate(files):
+                filename = upload.filename or "unnamed.png"
+                filenames.append(filename)
+                try:
+                    # Drain the multipart spool in fixed-size chunks straight
+                    # onto disk: the batch's originals are never accumulated
+                    # in memory.  Blocking writes/validation run in worker
+                    # threads so the event loop stays responsive.
+                    while True:
+                        chunk = await upload.read(STAGING_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        await asyncio.to_thread(
+                            service.stage_chunk, session_id, index, filename, chunk
+                        )
+                    await asyncio.to_thread(
+                        service.finish_file, session_id, index, filename
+                    )
+                finally:
+                    await upload.close()
+            # All files are on disk and validated; only now register/dispatch.
+            batch = await asyncio.to_thread(service.commit_upload, session_id, filenames)
         except JobRejected as exc:
+            # Bad image, oversized file or write failure: refuse the whole
+            # batch and remove every partial file this request left behind.
+            await asyncio.to_thread(service.abort_upload, session_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         snapshot = service.get_batch(batch.batch_id)
         assert snapshot is not None
         return JSONResponse(status_code=201, content=snapshot)

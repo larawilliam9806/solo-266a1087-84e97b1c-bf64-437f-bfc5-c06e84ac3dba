@@ -5,3 +5,6 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+# Local-disk staging area for uploaded originals (container uses a volume).
+.staging/
+staging/

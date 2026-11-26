@@ -13,6 +13,11 @@ services:
       THUMBNAIL_MAX_EDGE: "${THUMBNAIL_MAX_EDGE:-256}"
       # Per-file upload cap in bytes; 0 disables it.
       THUMBNAIL_MAX_UPLOAD_BYTES: "${THUMBNAIL_MAX_UPLOAD_BYTES:-0}"
+      # Local-disk staging directory for uploaded originals.
+      THUMBNAIL_STAGING_DIR: "/srv/staging"
+    volumes:
+      # Staged originals live on a named volume backed by the host disk.
+      - thumbnail-staging:/srv/staging
     healthcheck:
       test:
         - CMD
@@ -26,3 +31,6 @@ services:
     # One container, one process: in-memory scheduler state is not shared.
     deploy:
       replicas: 1
+
+volumes:
+  thumbnail-staging:

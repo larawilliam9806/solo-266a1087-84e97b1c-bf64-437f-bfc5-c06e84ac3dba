@@ -10,6 +10,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Originals are streamed into this directory while a batch upload is in
+# flight and stay there until a job's last execution copy finishes.  A named
+# volume (see docker-compose.yml) backs it so the data survives image updates.
+RUN mkdir -p /srv/staging
+ENV THUMBNAIL_STAGING_DIR=/srv/staging
+
 EXPOSE 8000
 
 # Single process: the scheduler state is in-memory, so do not add --workers > 1.
